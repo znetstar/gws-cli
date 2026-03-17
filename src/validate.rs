@@ -137,6 +137,79 @@ pub fn validate_safe_dir_path(dir: &str) -> Result<PathBuf, GwsError> {
     Ok(canonical)
 }
 
+/// Validates that a file path (e.g. `--upload` or `--output`) is safe.
+///
+/// Rejects paths that escape above CWD via `..` traversal, contain
+/// control characters, or follow symlinks to locations outside CWD.
+/// Absolute paths are allowed (reading an existing file from a known
+/// location is legitimate) but the resolved target must still live
+/// under CWD.
+///
+/// # TOCTOU caveat
+///
+/// This is a best-effort defence-in-depth check. A local attacker with
+/// write access to a parent directory could replace a path component
+/// between this validation and the subsequent I/O. Fully eliminating
+/// TOCTOU would require `openat(O_NOFOLLOW)` on each path component,
+/// which is tracked as a follow-up for Unix platforms.
+pub fn validate_safe_file_path(path_str: &str, flag_name: &str) -> Result<PathBuf, GwsError> {
+    reject_control_chars(path_str, flag_name)?;
+
+    let path = Path::new(path_str);
+    let cwd = std::env::current_dir()
+        .map_err(|e| GwsError::Validation(format!("Failed to determine current directory: {e}")))?;
+
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    // For existing files, canonicalize to resolve symlinks.
+    // For non-existing files, get the prefix canonicalized then normalize
+    // the remaining components to resolve any `..` or `.` segments.
+    let canonical = if resolved.exists() {
+        resolved.canonicalize().map_err(|e| {
+            GwsError::Validation(format!("Failed to resolve {flag_name} '{}': {e}", path_str))
+        })?
+    } else {
+        let raw = normalize_non_existing(&resolved)?;
+        // normalize_non_existing does NOT resolve `..` in the non-existent
+        // suffix. We must resolve them here to prevent bypass via paths like
+        // `non_existent/../../etc/passwd`.
+        normalize_dotdot(&raw)
+    };
+
+    let canonical_cwd = cwd.canonicalize().map_err(|e| {
+        GwsError::Validation(format!("Failed to canonicalize current directory: {e}"))
+    })?;
+
+    if !canonical.starts_with(&canonical_cwd) {
+        return Err(GwsError::Validation(format!(
+            "{flag_name} '{}' resolves to '{}' which is outside the current directory",
+            path_str,
+            canonical.display()
+        )));
+    }
+
+    Ok(canonical)
+}
+
+/// Resolve `.` and `..` components in a path without touching the filesystem.
+fn normalize_dotdot(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Rejects strings containing null bytes, ASCII control characters
 /// (including DEL, 0x7F), or dangerous Unicode characters such as
 /// zero-width chars, bidi overrides, and Unicode line/paragraph separators.
@@ -700,5 +773,91 @@ mod tests {
     #[test]
     fn test_validate_api_identifier_empty() {
         assert!(validate_api_identifier("").is_err());
+    }
+
+    // --- validate_safe_file_path ---
+
+    #[test]
+    #[serial]
+    fn test_file_path_relative_is_ok() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+        fs::write(canonical_dir.join("test.txt"), "data").unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("test.txt", "--upload");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_traversal() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("../../etc/passwd", "--upload");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(result.is_err(), "path traversal should be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("outside"),
+            "error should mention 'outside'"
+        );
+    }
+
+    #[test]
+    fn test_file_path_rejects_control_chars() {
+        let result = validate_safe_file_path("file\x00.txt", "--output");
+        assert!(result.is_err(), "null bytes should be rejected");
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_symlink_escape() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        // Create a symlink that points outside the directory
+        #[cfg(unix)]
+        {
+            let link_path = canonical_dir.join("escape");
+            std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+
+            let saved_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&canonical_dir).unwrap();
+
+            let result = validate_safe_file_path("escape/secret.txt", "--output");
+            std::env::set_current_dir(&saved_cwd).unwrap();
+
+            assert!(result.is_err(), "symlink escape should be rejected");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_file_path_rejects_traversal_via_nonexistent_prefix() {
+        // Regression: non_existent/../../etc/passwd could bypass starts_with
+        // because normalize_non_existing preserves ".." in the non-existent
+        // suffix. The normalize_dotdot fix resolves this.
+        let dir = tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&canonical_dir).unwrap();
+
+        let result = validate_safe_file_path("doesnt_exist/../../etc/passwd", "--output");
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(
+            result.is_err(),
+            "traversal via non-existent prefix should be rejected"
+        );
     }
 }

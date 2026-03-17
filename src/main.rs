@@ -227,6 +227,22 @@ async fn run() -> Result<(), GwsError> {
         .flatten()
         .map(|s| s.as_str());
 
+    // Validate file paths against traversal before any I/O.
+    // Use the returned canonical paths so the validated path is the one
+    // actually used for I/O (closes TOCTOU gap).
+    let upload_path_buf = if let Some(p) = upload_path {
+        Some(crate::validate::validate_safe_file_path(p, "--upload")?)
+    } else {
+        None
+    };
+    let output_path_buf = if let Some(p) = output_path {
+        Some(crate::validate::validate_safe_file_path(p, "--output")?)
+    } else {
+        None
+    };
+    let upload_path = upload_path_buf.as_deref().and_then(|p| p.to_str());
+    let output_path = output_path_buf.as_deref().and_then(|p| p.to_str());
+
     let dry_run = matched_args.get_flag("dry-run");
 
     // Build pagination config from flags

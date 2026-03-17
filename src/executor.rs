@@ -798,30 +798,37 @@ fn handle_error_response<T>(
 /// represents the *source* type (what the bytes are). When a user uploads
 /// `notes.md` with `"mimeType":"application/vnd.google-apps.document"`, the
 /// media part should be `text/markdown`, not a Google Workspace MIME type.
+///
+/// All returned MIME types have control characters stripped to prevent
+/// MIME header injection via user-controlled metadata.
 fn resolve_upload_mime(
     explicit: Option<&str>,
     upload_path: Option<&str>,
     metadata: &Option<Value>,
 ) -> String {
-    if let Some(mime) = explicit {
-        return mime.to_string();
-    }
+    let raw = explicit
+        .map(|s| s.to_string())
+        .or_else(|| {
+            upload_path
+                .and_then(mime_from_extension)
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|m| m.get("mimeType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    if let Some(path) = upload_path {
-        if let Some(detected) = mime_from_extension(path) {
-            return detected.to_string();
-        }
+    // Strip CR/LF and other control characters to prevent MIME header injection.
+    let sanitized: String = raw.chars().filter(|c| !c.is_control()).collect();
+    if sanitized.is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        sanitized
     }
-
-    if let Some(mime) = metadata
-        .as_ref()
-        .and_then(|m| m.get("mimeType"))
-        .and_then(|v| v.as_str())
-    {
-        return mime.to_string();
-    }
-
-    "application/octet-stream".to_string()
 }
 
 /// Infers a MIME type from a file path's extension.
@@ -1457,6 +1464,28 @@ mod tests {
             mime, "text/markdown",
             "--upload-content-type overrides metadata for media part"
         );
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_sanitizes_crlf_injection() {
+        // A malicious mimeType with CRLF should be stripped to prevent
+        // MIME header injection in the multipart body.
+        let metadata = Some(json!({
+            "mimeType": "text/plain\r\nX-Injected: malicious"
+        }));
+        let mime = resolve_upload_mime(None, None, &metadata);
+        assert!(
+            !mime.contains('\r') && !mime.contains('\n'),
+            "control characters must be stripped: got '{mime}'"
+        );
+        assert_eq!(mime, "text/plainX-Injected: malicious");
+    }
+
+    #[test]
+    fn test_resolve_upload_mime_all_control_chars_fallback() {
+        let metadata = Some(json!({ "mimeType": "\r\n\t" }));
+        let mime = resolve_upload_mime(None, None, &metadata);
+        assert_eq!(mime, "application/octet-stream");
     }
 
     #[tokio::test]
