@@ -53,7 +53,10 @@ pub(super) async fn handle_renew(
                 "note": "Run without --dry-run to actually renew subscriptions"
             })
         };
-        println!("{}", serde_json::to_string_pretty(&result).context("Failed to serialize dry-run output")?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("Failed to serialize dry-run output")?
+        );
         return Ok(());
     }
 
@@ -78,7 +81,10 @@ pub(super) async fn handle_renew(
             .context("Failed to reactivate subscription")?;
 
         let body: Value = resp.json().await.context("Failed to parse response")?;
-        println!("{}", serde_json::to_string_pretty(&body).context("Failed to serialize response body")?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).context("Failed to serialize response body")?
+        );
     } else {
         let within_secs = parse_duration(&config.within)?;
         let resp = client
@@ -119,7 +125,10 @@ pub(super) async fn handle_renew(
             "status": "success",
             "renewed": renewed,
         });
-        println!("{}", serde_json::to_string_pretty(&result).context("Failed to serialize result")?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).context("Failed to serialize result")?
+        );
     }
 
     Ok(())

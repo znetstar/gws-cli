@@ -134,7 +134,11 @@ pub(super) async fn handle_subscribe(
                     "subscription": sub_name.0,
                     "note": "Run without --dry-run to actually start listening"
                 });
-                println!("{}", serde_json::to_string_pretty(&result).context("Failed to serialize dry-run output")?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .context("Failed to serialize dry-run output")?
+                );
                 return Ok(());
             }
             (sub_name.0.clone(), None, None, false)
@@ -172,7 +176,10 @@ pub(super) async fn handle_subscribe(
                 eprintln!("Would create Pub/Sub topic: {topic}");
                 eprintln!("Would create Pub/Sub subscription: {sub}");
                 eprintln!("Would create Workspace Events subscription for target: {target}");
-                eprintln!("Would listen for event types: {}", config.event_types.join(", "));
+                eprintln!(
+                    "Would listen for event types: {}",
+                    config.event_types.join(", ")
+                );
 
                 let result = json!({
                     "dry_run": true,
@@ -183,15 +190,21 @@ pub(super) async fn handle_subscribe(
                     "event_types": config.event_types,
                     "note": "Run without --dry-run to actually create subscription"
                 });
-                println!("{}", serde_json::to_string_pretty(&result).context("Failed to serialize dry-run output")?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result)
+                        .context("Failed to serialize dry-run output")?
+                );
                 return Ok(());
             }
 
             // 1. Create Pub/Sub topic
             eprintln!("Creating Pub/Sub topic: {topic}");
-            let token = pubsub_token
-                .as_ref()
-                .ok_or_else(|| GwsError::Auth("Token unavailable in non-dry-run mode. This indicates a bug.".to_string()))?;
+            let token = pubsub_token.as_ref().ok_or_else(|| {
+                GwsError::Auth(
+                    "Token unavailable in non-dry-run mode. This indicates a bug.".to_string(),
+                )
+            })?;
             let resp = client
                 .put(format!("{PUBSUB_API_BASE}/{topic}"))
                 .bearer_auth(token)
