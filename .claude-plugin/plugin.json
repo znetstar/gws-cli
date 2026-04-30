@@ -1,0 +1,25 @@
+{
+  "name": "google-workspace-cli",
+  "version": "0.22.5",
+  "description": "Bundle of Claude skills for the gws CLI: per-service helpers (Drive, Gmail, Calendar, Docs, Sheets, Slides, Tasks, Chat, Meet, Forms, Keep, Classroom, People, Admin, Vault, Model Armor), workflow composers, persona overlays, and end-to-end recipes.",
+  "author": {
+    "name": "Justin Poehnelt",
+    "email": "justin.poehnelt@gmail.com"
+  },
+  "homepage": "https://github.com/googleworkspace/cli",
+  "repository": "https://github.com/googleworkspace/cli",
+  "license": "Apache-2.0",
+  "keywords": [
+    "google-workspace",
+    "gws",
+    "drive",
+    "gmail",
+    "calendar",
+    "docs",
+    "sheets",
+    "slides",
+    "tasks",
+    "chat",
+    "skills"
+  ]
+}

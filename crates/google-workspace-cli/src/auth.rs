@@ -84,8 +84,9 @@ async fn refresh_token_with_reqwest(
 ///
 /// Priority:
 /// 1. `GOOGLE_WORKSPACE_PROJECT_ID` environment variable.
-/// 2. `project_id` from the OAuth client configuration (`client_secret.json`).
-/// 3. `quota_project_id` from Application Default Credentials (ADC).
+/// 2. `project_id` field from the active 1Password item (if the 1Password backend was used).
+/// 3. `project_id` from the OAuth client configuration (`client_secret.json`).
+/// 4. `quota_project_id` from Application Default Credentials (ADC).
 pub fn get_quota_project() -> Option<String> {
     // 1. Explicit environment variable (highest priority)
     if let Ok(project_id) = std::env::var("GOOGLE_WORKSPACE_PROJECT_ID") {
@@ -94,7 +95,16 @@ pub fn get_quota_project() -> Option<String> {
         }
     }
 
-    // 2. Project ID from the OAuth client configuration (set via `gws auth setup`)
+    // 2. project_id from the active 1Password item, if `fetch_item` ran during this invocation
+    if let Some(fields) = crate::auth_op::cached_fields() {
+        if let Some(pid) = fields.project_id {
+            if !pid.is_empty() {
+                return Some(pid);
+            }
+        }
+    }
+
+    // 3. Project ID from the OAuth client configuration (set via `gws auth setup`)
     if let Ok(config) = crate::oauth_config::load_client_config() {
         if !config.project_id.is_empty() {
             return Some(config.project_id);
@@ -204,6 +214,7 @@ impl AccessTokenProvider for FakeTokenProvider {
 ///
 /// Tries credentials in order:
 /// 0. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token, highest priority)
+/// 0.5. `GOOGLE_WORKSPACE_CLI_OP_ITEM` (+ optional `OP_VAULT`) — fetch from 1Password via `op` CLI
 /// 1. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var (plaintext JSON, can be User or Service Account)
 /// 2. Encrypted credentials at `~/.config/gws/credentials.enc`
 /// 3. Plaintext credentials at `~/.config/gws/credentials.json` (User only)
@@ -245,11 +256,21 @@ async fn get_token_inner(
     creds: Credential,
     token_cache_path: &std::path::Path,
 ) -> anyhow::Result<String> {
+    // When the 1Password backend supplied the credentials, skip the on-disk
+    // token cache entirely. The cache is encrypted with a key from the OS
+    // keyring; mixing it with 1Password produces a second biometric prompt per
+    // invocation. In-memory caching within yup-oauth2 still works, and the
+    // refresh-token round-trip per CLI invocation is cheap (~100ms) compared
+    // to the prompt friction.
+    let use_op = crate::auth_op::cached_fields().is_some();
+
     match creds {
         Credential::AuthorizedUser(ref secret) => {
             // If proxy env vars are set, use reqwest directly (it supports proxy)
-            // This avoids waiting for yup-oauth2's hyper client to timeout
-            if has_proxy_env() {
+            // This avoids waiting for yup-oauth2's hyper client to timeout.
+            // Same reqwest path is also the cleanest way to skip token caching
+            // when the credentials came from 1Password.
+            if has_proxy_env() || use_op {
                 return refresh_token_with_reqwest(
                     &secret.client_id,
                     &secret.client_secret,
@@ -274,14 +295,17 @@ async fn get_token_inner(
                 .to_string())
         }
         Credential::ServiceAccount(key) => {
-            let tc_filename = token_cache_path
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| "token_cache.json".to_string());
-            let sa_cache = token_cache_path.with_file_name(format!("sa_{tc_filename}"));
-            let builder = yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(
-                Box::new(crate::token_storage::EncryptedTokenStorage::new(sa_cache)),
-            );
+            let mut builder = yup_oauth2::ServiceAccountAuthenticator::builder(key);
+            if !use_op {
+                let tc_filename = token_cache_path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "token_cache.json".to_string());
+                let sa_cache = token_cache_path.with_file_name(format!("sa_{tc_filename}"));
+                builder = builder.with_storage(Box::new(
+                    crate::token_storage::EncryptedTokenStorage::new(sa_cache),
+                ));
+            }
 
             let auth = builder
                 .build()
@@ -337,6 +361,19 @@ async fn load_credentials_inner(
     enc_path: &std::path::Path,
     default_path: &std::path::Path,
 ) -> anyhow::Result<Credential> {
+    // 0.5. 1Password backend — fetch credentials live from a 1Password item
+    // when GOOGLE_WORKSPACE_CLI_OP_ITEM is set. Auth mode (desktop app vs
+    // service-account token) is delegated entirely to the `op` CLI itself.
+    if let Ok(item) = std::env::var("GOOGLE_WORKSPACE_CLI_OP_ITEM") {
+        if !item.trim().is_empty() {
+            let vault = std::env::var("GOOGLE_WORKSPACE_CLI_OP_VAULT").ok();
+            let op_ref = crate::auth_op::OpRef::parse(&item, vault.as_deref())?;
+            let fields = crate::auth_op::fetch_item(&op_ref).await?;
+            let json = crate::auth_op::fields_to_credential_json(&fields)?;
+            return parse_credential_file(std::path::Path::new("<1password>"), &json).await;
+        }
+    }
+
     // 1. Explicit env var — plaintext file (User or Service Account)
     if let Some(path) = env_file {
         let p = PathBuf::from(path);
@@ -738,6 +775,77 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn test_load_credentials_via_1password_authorized_user() {
+        crate::auth_op::reset_cache_for_test();
+        // Inject a stub `op` runner that returns a canned API-Credential item.
+        crate::auth_op::set_op_runner_for_test(|_args| crate::auth_op::OpOutput {
+            status: Some(0),
+            stdout: r#"{
+                "title": "GWS CLI",
+                "fields": [
+                    {"label": "client_id", "value": "op_id"},
+                    {"label": "client_secret", "value": "op_secret"},
+                    {"label": "refresh_token", "value": "op_rt"},
+                    {"label": "project_id", "value": "op_project"}
+                ]
+            }"#
+            .to_string(),
+            stderr: String::new(),
+            spawn_error: None,
+        });
+        let _item_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_OP_ITEM", "op://Vault/item-id");
+        let _vault_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_OP_VAULT");
+
+        let res = load_credentials_inner(
+            None,
+            &PathBuf::from("/missing/enc"),
+            &PathBuf::from("/missing/plain"),
+        )
+        .await
+        .expect("1Password tier should produce a Credential");
+
+        match res {
+            Credential::AuthorizedUser(secret) => {
+                assert_eq!(secret.client_id, "op_id");
+                assert_eq!(secret.client_secret, "op_secret");
+                assert_eq!(secret.refresh_token, "op_rt");
+            }
+            _ => panic!("Expected AuthorizedUser from 1Password"),
+        }
+
+        crate::auth_op::clear_op_runner_for_test();
+        crate::auth_op::reset_cache_for_test();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_load_credentials_via_1password_op_failure_propagates() {
+        crate::auth_op::reset_cache_for_test();
+        crate::auth_op::set_op_runner_for_test(|_args| crate::auth_op::OpOutput {
+            status: Some(1),
+            stdout: String::new(),
+            stderr: "could not connect to 1Password.app".to_string(),
+            spawn_error: None,
+        });
+        let _item_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_OP_ITEM", "op://Vault/item-id");
+        let _vault_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_OP_VAULT");
+
+        let err = load_credentials_inner(
+            None,
+            &PathBuf::from("/missing/enc"),
+            &PathBuf::from("/missing/plain"),
+        )
+        .await
+        .expect_err("op failure should bubble up");
+        let msg = err.to_string();
+        assert!(msg.contains("desktop app"), "{msg}");
+
+        crate::auth_op::clear_op_runner_for_test();
+        crate::auth_op::reset_cache_for_test();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn test_scoped_token_provider_uses_get_token() {
         let _token_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_CLI_TOKEN", "provider-token");
         let provider = token_provider(&["https://www.googleapis.com/auth/drive"]);
@@ -926,6 +1034,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_get_quota_project_priority_env_var() {
+        crate::auth_op::reset_cache_for_test();
         let _env_guard = EnvVarGuard::set("GOOGLE_WORKSPACE_PROJECT_ID", "priority-env");
         let _adc_guard = EnvVarGuard::remove("GOOGLE_APPLICATION_CREDENTIALS");
         let _config_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
@@ -937,6 +1046,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_get_quota_project_priority_config() {
+        crate::auth_op::reset_cache_for_test();
         let tmp = tempfile::tempdir().unwrap();
         let _config_guard = EnvVarGuard::set(
             "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
@@ -955,6 +1065,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_get_quota_project_priority_adc_fallback() {
+        crate::auth_op::reset_cache_for_test();
         let tmp = tempfile::tempdir().unwrap();
         let adc_dir = tmp.path().join(".config").join("gcloud");
         std::fs::create_dir_all(&adc_dir).unwrap();
@@ -975,6 +1086,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_get_quota_project_reads_adc() {
+        crate::auth_op::reset_cache_for_test();
         let tmp = tempfile::tempdir().unwrap();
         let adc_dir = tmp.path().join(".config").join("gcloud");
         std::fs::create_dir_all(&adc_dir).unwrap();
@@ -991,5 +1103,49 @@ mod tests {
         let _config_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
 
         assert_eq!(get_quota_project(), Some("my-project-123".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_quota_project_priority_1password_over_config() {
+        // Regression: when fetch_item ran during this invocation, the
+        // 1Password project_id outranks the saved client_secret.json project_id.
+        crate::auth_op::reset_cache_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let _config_guard = EnvVarGuard::set(
+            "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+            tmp.path().to_str().unwrap(),
+        );
+        let _env_guard = EnvVarGuard::remove("GOOGLE_WORKSPACE_PROJECT_ID");
+        let _adc_guard = EnvVarGuard::remove("GOOGLE_APPLICATION_CREDENTIALS");
+        let _home_guard = EnvVarGuard::set("HOME", "/missing/home");
+        crate::oauth_config::save_client_config("id", "secret", "config-project").unwrap();
+
+        // Simulate a prior fetch_item call during this CLI invocation.
+        crate::auth_op::set_op_runner_for_test(|_args| crate::auth_op::OpOutput {
+            status: Some(0),
+            stdout: r#"{
+                "title": "X",
+                "fields": [
+                    {"label": "client_id", "value": "cid"},
+                    {"label": "client_secret", "value": "csec"},
+                    {"label": "refresh_token", "value": "rt"},
+                    {"label": "project_id", "value": "op_project"}
+                ]
+            }"#
+            .to_string(),
+            stderr: String::new(),
+            spawn_error: None,
+        });
+        let op_ref = crate::auth_op::OpRef::parse("op://Vault/item", None).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            crate::auth_op::fetch_item(&op_ref).await.unwrap();
+        });
+
+        assert_eq!(get_quota_project(), Some("op_project".to_string()));
+
+        crate::auth_op::clear_op_runner_for_test();
+        crate::auth_op::reset_cache_for_test();
     }
 }

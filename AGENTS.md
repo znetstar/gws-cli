@@ -198,6 +198,9 @@ See [`src/helpers/README.md`](crates/google-workspace-cli/src/helpers/README.md)
 | Variable | Description |
 |---|---|
 | `GOOGLE_WORKSPACE_CLI_TOKEN` | Pre-obtained OAuth2 access token (highest priority; bypasses all credential file loading) |
+| `GOOGLE_WORKSPACE_CLI_OP_ITEM` | 1Password item reference. Either a full `op://Vault/item-id` URI (vault embedded), or a bare item id/name when paired with `OP_VAULT`. Activates the 1Password auth backend (shells out to `op` CLI). |
+| `GOOGLE_WORKSPACE_CLI_OP_VAULT` | 1Password vault id or name. Required only when `OP_ITEM` is a bare reference. |
+| `OP_SERVICE_ACCOUNT_TOKEN` | Standard 1Password env var (passed through to `op`). When set, `op` runs in service-account mode (CI-friendly, no desktop app). When unset, `op` uses desktop-app integration (Touch ID). |
 | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | Path to OAuth credentials JSON (no default; if unset, falls back to encrypted credentials in `~/.config/gws/`) |
 | `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` | Keyring backend: `keyring` (default, uses OS keyring with file fallback) or `file` (file only, for Docker/CI/headless) |
 

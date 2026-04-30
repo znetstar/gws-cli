@@ -21,6 +21,7 @@
 
 mod auth;
 pub(crate) mod auth_commands;
+pub(crate) mod auth_op;
 mod client;
 mod commands;
 pub(crate) mod credential_store;

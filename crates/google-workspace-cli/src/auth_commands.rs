@@ -392,6 +392,33 @@ fn build_login_subcommand() -> clap::Command {
                 )
                 .value_name("services"),
         )
+        .arg(
+            clap::Arg::new("1password")
+                .long("1password")
+                .help("Save credentials to a 1Password item instead of an encrypted local file")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("op-vault")
+                .long("vault")
+                .help("1Password vault id or name (or set GOOGLE_WORKSPACE_CLI_OP_VAULT)")
+                .value_name("vault")
+                .requires("1password"),
+        )
+        .arg(
+            clap::Arg::new("op-item")
+                .long("item")
+                .help("1Password item id, name, or full op:// reference. Defaults to a title derived from the account email.")
+                .value_name("item")
+                .requires("1password"),
+        )
+        .arg(
+            clap::Arg::new("op-force")
+                .long("force")
+                .help("Overwrite an existing 1Password item")
+                .action(clap::ArgAction::SetTrue)
+                .requires("1password"),
+        )
 }
 
 /// Build the clap Command for `gws auth`.
@@ -448,9 +475,9 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
 
     match matches.subcommand() {
         Some(("login", sub_m)) => {
-            let (scope_mode, services_filter) = parse_login_args(sub_m);
+            let (scope_mode, services_filter, op_opts) = parse_login_args(sub_m);
 
-            handle_login_inner(scope_mode, services_filter).await
+            handle_login_inner(scope_mode, services_filter, op_opts).await
         }
         Some(("setup", sub_m)) => {
             // Collect remaining args and delegate to setup's own clap parser.
@@ -482,8 +509,24 @@ fn login_command() -> clap::Command {
     build_login_subcommand()
 }
 
-/// Extract `ScopeMode` and optional services filter from parsed login args.
-fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<String>>) {
+/// Where `gws auth login` should persist the resulting refresh token.
+#[derive(Debug, Default)]
+struct OpLoginOpts {
+    /// True when `--1password` was passed.
+    enabled: bool,
+    /// `--vault` value (falls back to `GOOGLE_WORKSPACE_CLI_OP_VAULT`).
+    vault: Option<String>,
+    /// `--item` value (id, name, or full `op://` ref). Defaults to a title
+    /// derived from the account email when omitted.
+    item: Option<String>,
+    /// `--force` allows overwriting an existing item.
+    force: bool,
+}
+
+/// Extract `ScopeMode`, optional services filter, and 1Password options from parsed login args.
+fn parse_login_args(
+    matches: &clap::ArgMatches,
+) -> (ScopeMode, Option<HashSet<String>>, OpLoginOpts) {
     let scope_mode = if let Some(scopes_str) = matches.get_one::<String>("scopes") {
         ScopeMode::Custom(
             scopes_str
@@ -508,7 +551,18 @@ fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<St
             .collect()
     });
 
-    (scope_mode, services_filter)
+    let op_opts = OpLoginOpts {
+        enabled: matches.get_flag("1password"),
+        vault: matches
+            .get_one::<String>("op-vault")
+            .cloned()
+            .or_else(|| std::env::var("GOOGLE_WORKSPACE_CLI_OP_VAULT").ok())
+            .filter(|s| !s.trim().is_empty()),
+        item: matches.get_one::<String>("op-item").cloned(),
+        force: matches.get_flag("op-force"),
+    };
+
+    (scope_mode, services_filter, op_opts)
 }
 
 /// Run the `auth login` flow.
@@ -532,9 +586,9 @@ pub async fn run_login(args: &[String]) -> Result<(), GwsError> {
         Err(e) => return Err(GwsError::Validation(e.to_string())),
     };
 
-    let (scope_mode, services_filter) = parse_login_args(&matches);
+    let (scope_mode, services_filter, op_opts) = parse_login_args(&matches);
 
-    handle_login_inner(scope_mode, services_filter).await
+    handle_login_inner(scope_mode, services_filter, op_opts).await
 }
 /// Custom delegate that prints the OAuth URL on its own line for easy copying.
 /// Optionally includes `login_hint` in the URL for account pre-selection.
@@ -576,6 +630,7 @@ impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelega
 async fn handle_login_inner(
     scope_mode: ScopeMode,
     services_filter: Option<HashSet<String>>,
+    op_opts: OpLoginOpts,
 ) -> Result<(), GwsError> {
     // Resolve client_id and client_secret:
     // 1. Env vars (highest priority)
@@ -640,23 +695,105 @@ async fn handle_login_inner(
     // Fetch the user's email from Google userinfo
     let actual_email = fetch_userinfo_email(&access_token).await;
 
-    // Save encrypted credentials
-    let enc_path = credential_store::save_encrypted(&creds_str)
-        .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+    // Branch: 1Password backend or local encrypted file.
+    let output = if op_opts.enabled {
+        save_login_to_1password(
+            &op_opts,
+            &client_id,
+            &client_secret,
+            &refresh_token,
+            actual_email.as_deref(),
+            project_id.as_deref(),
+            &scopes,
+        )
+        .await?
+    } else {
+        // Save encrypted credentials
+        let enc_path = credential_store::save_encrypted(&creds_str)
+            .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+        json!({
+            "status": "success",
+            "message": "Authentication successful. Encrypted credentials saved.",
+            "account": actual_email.as_deref().unwrap_or("(unknown)"),
+            "credentials_file": enc_path.display().to_string(),
+            "encryption": "AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)",
+            "scopes": scopes,
+        })
+    };
 
-    let output = json!({
-        "status": "success",
-        "message": "Authentication successful. Encrypted credentials saved.",
-        "account": actual_email.as_deref().unwrap_or("(unknown)"),
-        "credentials_file": enc_path.display().to_string(),
-        "encryption": "AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)",
-        "scopes": scopes,
-    });
     println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()
     );
     Ok(())
+}
+
+/// Persist OAuth credentials into a 1Password item.
+///
+/// Resolves the OpRef from `--vault` / `--item` (with env var fallbacks),
+/// derives a default item title from the account email when `--item` is
+/// omitted, and refuses to overwrite an existing item without `--force`.
+async fn save_login_to_1password(
+    op_opts: &OpLoginOpts,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+    account: Option<&str>,
+    project_id: Option<&str>,
+    scopes: &[String],
+) -> Result<serde_json::Value, GwsError> {
+    let item_value = match (op_opts.item.as_deref(), op_opts.vault.as_deref()) {
+        (Some(item), _) => item.to_string(),
+        (None, Some(_)) => match account {
+            Some(email) => format!("gws-cli ({email})"),
+            None => "gws-cli".to_string(),
+        },
+        (None, None) => {
+            return Err(GwsError::Validation(
+                "1Password mode requires either --vault, GOOGLE_WORKSPACE_CLI_OP_VAULT, \
+                 or a full op:// reference in --item."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let op_ref = crate::auth_op::OpRef::parse(&item_value, op_opts.vault.as_deref())
+        .map_err(|e| GwsError::Validation(format!("Invalid 1Password reference: {e:#}")))?;
+
+    let fields = crate::auth_op::OpItemFields {
+        client_id: Some(client_id.to_string()),
+        client_secret: Some(client_secret.to_string()),
+        refresh_token: Some(refresh_token.to_string()),
+        account: account.map(str::to_string),
+        project_id: project_id.map(str::to_string),
+        ..Default::default()
+    };
+
+    let saved_title = crate::auth_op::put_item(&op_ref, &fields, op_opts.force)
+        .await
+        .map_err(|e| GwsError::Auth(format!("1Password write failed: {e:#}")))?;
+
+    let mut hint = format!(
+        "export GOOGLE_WORKSPACE_CLI_OP_ITEM={}",
+        match (&op_ref.vault, &op_ref.item) {
+            (Some(v), i) => format!("op://{v}/{i}"),
+            (None, i) => i.clone(),
+        }
+    );
+    if op_ref.vault.is_none() {
+        hint.push_str("\nexport GOOGLE_WORKSPACE_CLI_OP_VAULT=<vault>");
+    }
+
+    Ok(json!({
+        "status": "success",
+        "message": "Authentication successful. Credentials saved to 1Password.",
+        "account": account.unwrap_or("(unknown)"),
+        "auth_method": "1password",
+        "op_vault": op_ref.vault,
+        "op_item": saved_title,
+        "next_steps": hint,
+        "scopes": scopes,
+    }))
 }
 
 /// Fetch the authenticated user's email from Google's userinfo endpoint.
@@ -681,6 +818,51 @@ async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
 }
 
 async fn handle_export(unmasked: bool) -> Result<(), GwsError> {
+    // 1Password backend: fetch the live item and emit a credentials JSON view.
+    if let Some(item_env) = std::env::var("GOOGLE_WORKSPACE_CLI_OP_ITEM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let vault = std::env::var("GOOGLE_WORKSPACE_CLI_OP_VAULT").ok();
+        let op_ref = crate::auth_op::OpRef::parse(&item_env, vault.as_deref())
+            .map_err(|e| GwsError::Validation(format!("Invalid 1Password reference: {e:#}")))?;
+        let fields = crate::auth_op::fetch_item(&op_ref)
+            .await
+            .map_err(|e| GwsError::Auth(format!("1Password fetch failed: {e:#}")))?;
+
+        let mask = |s: &str| -> serde_json::Value { json!(mask_secret(s)) };
+        let pass = |s: &str| -> serde_json::Value { json!(s) };
+        let v = if unmasked { pass } else { mask };
+
+        let mut creds = json!({
+            "type": if fields.service_account_json.is_some() { "service_account" } else { "authorized_user" },
+        });
+        let obj = creds.as_object_mut().unwrap();
+        if let Some(s) = fields.client_id.as_deref() {
+            obj.insert("client_id".to_string(), json!(s));
+        }
+        if let Some(s) = fields.client_secret.as_deref() {
+            obj.insert("client_secret".to_string(), v(s));
+        }
+        if let Some(s) = fields.refresh_token.as_deref() {
+            obj.insert("refresh_token".to_string(), v(s));
+        }
+        if let Some(s) = fields.service_account_json.as_deref() {
+            obj.insert("service_account_json".to_string(), v(s));
+        }
+        if let Some(s) = fields.account.as_deref() {
+            obj.insert("account".to_string(), json!(s));
+        }
+        if let Some(s) = fields.project_id.as_deref() {
+            obj.insert("project_id".to_string(), json!(s));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&creds).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
     let enc_path = credential_store::encrypted_credentials_path();
     if !enc_path.exists() {
         return Err(GwsError::Auth(
@@ -1200,6 +1382,14 @@ fn run_simple_scope_picker(services_filter: Option<&HashSet<String>>) -> Option<
 }
 
 async fn handle_status() -> Result<(), GwsError> {
+    // 1Password backend takes precedence — no local credential files involved.
+    if let Some(item) = std::env::var("GOOGLE_WORKSPACE_CLI_OP_ITEM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return handle_status_1password(&item).await;
+    }
+
     let plain_path = plain_credentials_path();
     let enc_path = credential_store::encrypted_credentials_path();
     let token_cache = token_cache_path();
@@ -1453,6 +1643,105 @@ async fn handle_status() -> Result<(), GwsError> {
     Ok(())
 }
 
+/// `gws auth status` when the 1Password backend is active.
+///
+/// Skips the local-credential file introspection and instead fetches the
+/// active item, masks its fields, and live-validates the access token by
+/// going through `auth::get_token` (which routes through 1Password).
+async fn handle_status_1password(item_env: &str) -> Result<(), GwsError> {
+    let vault = std::env::var("GOOGLE_WORKSPACE_CLI_OP_VAULT").ok();
+    let op_ref = match crate::auth_op::OpRef::parse(item_env, vault.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(GwsError::Validation(format!(
+                "Invalid 1Password reference: {e:#}"
+            )));
+        }
+    };
+
+    let mut output = json!({
+        "auth_method": "1password",
+        "op_vault": op_ref.vault,
+        "op_item": op_ref.item,
+        "credential_source": "1password",
+    });
+
+    // Skip remote calls in test builds.
+    if cfg!(test) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    match crate::auth_op::fetch_item(&op_ref).await {
+        Ok(fields) => {
+            output["op_item_title"] = json!(fields.item_title);
+            output["account"] = json!(fields.account);
+            if let Some(pid) = &fields.project_id {
+                output["project_id"] = json!(pid);
+            }
+            if let Some(cid) = &fields.client_id {
+                let masked = if cid.len() > 12 {
+                    format!("{}...{}", &cid[..8], &cid[cid.len() - 4..])
+                } else {
+                    cid.clone()
+                };
+                output["client_id"] = json!(masked);
+            }
+            output["has_refresh_token"] = json!(fields.refresh_token.is_some());
+            output["has_service_account_json"] = json!(fields.service_account_json.is_some());
+        }
+        Err(e) => {
+            output["op_fetch_error"] = json!(e.to_string());
+        }
+    }
+
+    // Live token validation via the unified auth path. We request a minimal
+    // scope so the user doesn't get prompted for new consent here.
+    match crate::auth::get_token(&["https://www.googleapis.com/auth/userinfo.email"]).await {
+        Ok(access_token) => {
+            output["token_valid"] = json!(true);
+            if let Ok(http_client) = crate::client::shared_client() {
+                if let Ok(user_resp) = http_client
+                    .get("https://www.googleapis.com/oauth2/v1/userinfo")
+                    .bearer_auth(&access_token)
+                    .send()
+                    .await
+                {
+                    if let Ok(user_json) = user_resp.json::<serde_json::Value>().await {
+                        if let Some(email) = user_json.get("email").and_then(|v| v.as_str()) {
+                            output["user"] = json!(email);
+                        }
+                    }
+                }
+                let tokeninfo_url =
+                    format!("https://oauth2.googleapis.com/tokeninfo?access_token={access_token}");
+                if let Ok(info_resp) = http_client.get(&tokeninfo_url).send().await {
+                    if let Ok(info_json) = info_resp.json::<serde_json::Value>().await {
+                        if let Some(scope_str) = info_json.get("scope").and_then(|v| v.as_str()) {
+                            let scopes: Vec<&str> = scope_str.split(' ').collect();
+                            output["scope_count"] = json!(scopes.len());
+                            output["scopes"] = json!(scopes);
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            output["token_valid"] = json!(false);
+            output["token_error"] = json!(e.to_string());
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn handle_logout() -> Result<(), GwsError> {
     let plain_path = plain_credentials_path();
     let enc_path = credential_store::encrypted_credentials_path();
@@ -1473,16 +1762,32 @@ fn handle_logout() -> Result<(), GwsError> {
     // Invalidate cached account timezone (may belong to old account)
     crate::timezone::invalidate_cache();
 
+    let op_active = std::env::var("GOOGLE_WORKSPACE_CLI_OP_ITEM")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    let op_notice = if op_active {
+        Some(
+            "GOOGLE_WORKSPACE_CLI_OP_ITEM is set: only local cache was cleared. \
+             To remove the 1Password item itself, use `op item delete`."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     let output = if removed.is_empty() {
         json!({
             "status": "success",
             "message": "No credentials found to remove.",
+            "op_notice": op_notice,
         })
     } else {
         json!({
             "status": "success",
             "message": "Logged out. All credentials and token caches removed.",
             "removed": removed,
+            "op_notice": op_notice,
         })
     };
 

@@ -375,6 +375,9 @@ pub struct SetupOptions {
     pub project: Option<String>,
     pub dry_run: bool,
     pub login: bool,
+    pub one_password: bool,
+    pub op_vault: Option<String>,
+    pub op_item: Option<String>,
 }
 
 /// Build the clap Command for `gws auth setup`.
@@ -399,6 +402,26 @@ fn setup_command() -> clap::Command {
                 .help("Preview changes without making them")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            clap::Arg::new("1password")
+                .long("1password")
+                .help("Configure 1Password as the credential backend (skips gcloud project setup)")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("op-vault")
+                .long("vault")
+                .help("1Password vault id or name (required with --1password)")
+                .value_name("vault")
+                .requires("1password"),
+        )
+        .arg(
+            clap::Arg::new("op-item")
+                .long("item")
+                .help("1Password item id, name, or full op:// reference")
+                .value_name("item")
+                .requires("1password"),
+        )
 }
 
 /// Parse setup flags from args using clap.
@@ -412,6 +435,9 @@ pub fn parse_setup_args(args: &[String]) -> Result<Option<SetupOptions>, GwsErro
             project: matches.get_one::<String>("project").cloned(),
             dry_run: matches.get_flag("dry-run"),
             login: matches.get_flag("login"),
+            one_password: matches.get_flag("1password"),
+            op_vault: matches.get_one::<String>("op-vault").cloned(),
+            op_item: matches.get_one::<String>("op-item").cloned(),
         })),
         Err(e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
@@ -1623,6 +1649,12 @@ pub async fn run_setup(args: &[String]) -> Result<(), GwsError> {
         Some(opts) => opts,
         None => return Ok(()), // --help was printed, exit cleanly
     };
+
+    // 1Password setup is a separate, much shorter flow — bypass the gcloud wizard.
+    if opts.one_password {
+        return run_op_setup(&opts).await;
+    }
+
     let dry_run = opts.dry_run;
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin()) && !dry_run;
 
@@ -1709,6 +1741,137 @@ pub async fn run_setup(args: &[String]) -> Result<(), GwsError> {
         crate::auth_commands::run_login(&[]).await?;
     }
 
+    Ok(())
+}
+
+// ── 1Password guided setup ───────────────────────────────────────────
+
+/// Bare-bones 1Password vault descriptor parsed from `op vault list --format json`.
+#[derive(Debug, serde::Deserialize)]
+struct OpVault {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+impl OpVault {
+    fn display_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .or(self.title.as_deref())
+            .unwrap_or(self.id.as_str())
+    }
+}
+
+/// `gws auth setup --1password` — guided onboarding for the 1Password backend.
+///
+/// 1. Verifies the `op` CLI is installed.
+/// 2. Lists vaults via `op vault list --format json` (proves auth works).
+/// 3. If `--vault` is supplied, validates it exists, then chains into
+///    `gws auth login --1password --vault <chosen> [--item <item>]`.
+/// 4. Otherwise prints the vault list and a copy-pastable hint.
+pub async fn run_op_setup(opts: &SetupOptions) -> Result<(), GwsError> {
+    // 1. Sanity-check the op CLI is on PATH.
+    let version = tokio::process::Command::new("op")
+        .arg("--version")
+        .output()
+        .await;
+    match version {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(GwsError::Validation(format!(
+                "`op --version` failed: {}",
+                stderr.trim()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GwsError::Validation(
+                "1Password CLI ('op') not found in PATH. \
+                 Install: https://developer.1password.com/docs/cli/get-started"
+                    .to_string(),
+            ));
+        }
+        Err(e) => {
+            return Err(GwsError::Validation(format!("Failed to run `op`: {e}")));
+        }
+    }
+
+    // 2. List vaults — also doubles as an auth check.
+    let vaults_out = tokio::process::Command::new("op")
+        .args(["vault", "list", "--format", "json"])
+        .output()
+        .await
+        .map_err(|e| GwsError::Validation(format!("Failed to list 1Password vaults: {e}")))?;
+    if !vaults_out.status.success() {
+        let stderr = String::from_utf8_lossy(&vaults_out.stderr);
+        let stderr_lc = stderr.to_lowercase();
+        let hint = if stderr_lc.contains("connect to 1password.app")
+            || stderr_lc.contains("not currently signed in")
+        {
+            "Open the 1Password desktop app (or set OP_SERVICE_ACCOUNT_TOKEN for headless use)."
+        } else if stderr_lc.contains("service account") {
+            "OP_SERVICE_ACCOUNT_TOKEN may be invalid or revoked."
+        } else {
+            "Check your 1Password CLI auth setup."
+        };
+        return Err(GwsError::Validation(format!(
+            "`op vault list` failed: {}\n{}",
+            stderr.trim(),
+            hint
+        )));
+    }
+    let vaults: Vec<OpVault> = serde_json::from_slice(&vaults_out.stdout).map_err(|e| {
+        GwsError::Validation(format!("Failed to parse `op vault list` output: {e}"))
+    })?;
+
+    // 3. If a specific vault was named, chain into login. Otherwise display the list.
+    if let Some(chosen) = opts.op_vault.as_deref() {
+        let lc = chosen.to_lowercase();
+        let exists = vaults
+            .iter()
+            .any(|v| v.id.to_lowercase() == lc || v.display_name().to_lowercase() == lc);
+        if !exists {
+            return Err(GwsError::Validation(format!(
+                "Vault '{chosen}' not found. Available: {}",
+                vaults
+                    .iter()
+                    .map(|v| v.display_name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let mut login_args: Vec<String> = vec![
+            "--1password".to_string(),
+            "--vault".to_string(),
+            chosen.to_string(),
+        ];
+        if let Some(item) = opts.op_item.as_deref() {
+            login_args.push("--item".to_string());
+            login_args.push(item.to_string());
+        }
+        eprintln!(
+            "✓ 1Password CLI is reachable and vault '{chosen}' exists. Running `gws auth login --1password`…\n"
+        );
+        return crate::auth_commands::run_login(&login_args).await;
+    }
+
+    let output = json!({
+        "status": "success",
+        "message": "1Password CLI is installed and authenticated. Pick a vault, then run `gws auth login --1password --vault <name>`.",
+        "vaults": vaults
+            .iter()
+            .map(|v| json!({"id": v.id, "name": v.display_name()}))
+            .collect::<Vec<_>>(),
+        "next_steps": "gws auth setup --1password --vault <name>",
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
     Ok(())
 }
 
