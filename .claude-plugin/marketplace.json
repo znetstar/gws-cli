@@ -1,0 +1,14 @@
+{
+  "name": "gws-cli",
+  "owner": {
+    "name": "Justin Poehnelt",
+    "email": "justin.poehnelt@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "google-workspace-cli",
+      "source": "./",
+      "description": "Bundle of Claude skills for the gws CLI: per-service helpers (Drive, Gmail, Calendar, Docs, Sheets, Slides, Tasks, Chat, Meet, Forms, Keep, Classroom, People, Admin, Vault, Model Armor), workflow composers, persona overlays, and end-to-end recipes."
+    }
+  ]
+}
