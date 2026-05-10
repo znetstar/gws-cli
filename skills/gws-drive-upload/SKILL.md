@@ -30,6 +30,7 @@ gws drive +upload <file>
 | `<file>` | ✓ | — | Path to file to upload |
 | `--parent` | — | — | Parent folder ID |
 | `--name` | — | — | Target filename (defaults to source filename) |
+| `--convert` | — | — | Convert Office files to Google native formats on upload (.docx → Doc, .xlsx → Sheet, .pptx → Slides). No-op for other extensions. |
 
 ## Examples
 
@@ -37,12 +38,14 @@ gws drive +upload <file>
 gws drive +upload ./report.pdf
 gws drive +upload ./report.pdf --parent FOLDER_ID
 gws drive +upload ./data.csv --name 'Sales Data.csv'
+gws drive +upload ./report.docx --convert  # uploads as a Google Doc
 ```
 
 ## Tips
 
 - MIME type is detected automatically.
 - Filename is inferred from the local path unless --name is given.
+- --convert maps .docx → Google Doc, .xlsx → Google Sheet, .pptx → Google Slides.
 
 > [!CAUTION]
 > This is a **write** command — confirm with the user before executing.

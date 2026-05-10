@@ -51,16 +51,27 @@ impl Helper for DriveHelper {
                         .help("Target filename (defaults to source filename)")
                         .value_name("NAME"),
                 )
+                .arg(
+                    Arg::new("convert")
+                        .long("convert")
+                        .help(
+                            "Convert Office files to Google native formats on upload (.docx \
+                             → Doc, .xlsx → Sheet, .pptx → Slides). No-op for other extensions.",
+                        )
+                        .action(clap::ArgAction::SetTrue),
+                )
                 .after_help(
                     "\
 EXAMPLES:
   gws drive +upload ./report.pdf
   gws drive +upload ./report.pdf --parent FOLDER_ID
   gws drive +upload ./data.csv --name 'Sales Data.csv'
+  gws drive +upload ./report.docx --convert  # uploads as a Google Doc
 
 TIPS:
   MIME type is detected automatically.
-  Filename is inferred from the local path unless --name is given.",
+  Filename is inferred from the local path unless --name is given.
+  --convert maps .docx → Google Doc, .xlsx → Google Sheet, .pptx → Google Slides.",
                 ),
         );
         cmd
@@ -77,6 +88,7 @@ TIPS:
                 let file_path = matches.get_one::<String>("file").unwrap();
                 let parent_id = matches.get_one::<String>("parent");
                 let name_arg = matches.get_one::<String>("name");
+                let convert = matches.get_flag("convert");
 
                 // Determine filename
                 let filename = determine_filename(file_path, name_arg.map(|s| s.as_str()))?;
@@ -91,7 +103,13 @@ TIPS:
                 })?;
 
                 // Build metadata
-                let metadata = build_metadata(&filename, parent_id.map(|s| s.as_str()));
+                let target_mime = if convert {
+                    google_mime_for_path(file_path)
+                } else {
+                    None
+                };
+                let metadata =
+                    build_metadata(&filename, parent_id.map(|s| s.as_str()), target_mime);
 
                 let body_str = metadata.to_string();
 
@@ -142,7 +160,7 @@ fn determine_filename(file_path: &str, name_arg: Option<&str>) -> Result<String,
     }
 }
 
-fn build_metadata(filename: &str, parent_id: Option<&str>) -> Value {
+fn build_metadata(filename: &str, parent_id: Option<&str>, target_mime: Option<&str>) -> Value {
     let mut metadata = json!({
         "name": filename
     });
@@ -151,7 +169,27 @@ fn build_metadata(filename: &str, parent_id: Option<&str>) -> Value {
         metadata["parents"] = json!([parent]);
     }
 
+    if let Some(mime) = target_mime {
+        metadata["mimeType"] = json!(mime);
+    }
+
     metadata
+}
+
+/// Maps an Office file extension to its Google native target mimeType for
+/// Drive's on-upload conversion. Returns `None` for unsupported extensions
+/// (so `--convert` becomes a no-op rather than an error).
+fn google_mime_for_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "docx" => Some("application/vnd.google-apps.document"),
+        "xlsx" => Some("application/vnd.google-apps.spreadsheet"),
+        "pptx" => Some("application/vnd.google-apps.presentation"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -182,15 +220,73 @@ mod tests {
 
     #[test]
     fn test_build_metadata_no_parent() {
-        let meta = build_metadata("file.txt", None);
+        let meta = build_metadata("file.txt", None, None);
         assert_eq!(meta["name"], "file.txt");
         assert!(meta.get("parents").is_none());
+        assert!(meta.get("mimeType").is_none());
     }
 
     #[test]
     fn test_build_metadata_with_parent() {
-        let meta = build_metadata("file.txt", Some("folder123"));
+        let meta = build_metadata("file.txt", Some("folder123"), None);
         assert_eq!(meta["name"], "file.txt");
         assert_eq!(meta["parents"][0], "folder123");
+        assert!(meta.get("mimeType").is_none());
+    }
+
+    #[test]
+    fn test_build_metadata_with_target_mime() {
+        let meta = build_metadata(
+            "report.docx",
+            None,
+            Some("application/vnd.google-apps.document"),
+        );
+        assert_eq!(meta["name"], "report.docx");
+        assert_eq!(meta["mimeType"], "application/vnd.google-apps.document");
+    }
+
+    #[test]
+    fn test_google_mime_for_path_docx() {
+        assert_eq!(
+            google_mime_for_path("/tmp/report.docx"),
+            Some("application/vnd.google-apps.document")
+        );
+    }
+
+    #[test]
+    fn test_google_mime_for_path_xlsx() {
+        assert_eq!(
+            google_mime_for_path("./data.xlsx"),
+            Some("application/vnd.google-apps.spreadsheet")
+        );
+    }
+
+    #[test]
+    fn test_google_mime_for_path_pptx() {
+        assert_eq!(
+            google_mime_for_path("deck.pptx"),
+            Some("application/vnd.google-apps.presentation")
+        );
+    }
+
+    #[test]
+    fn test_google_mime_for_path_uppercase_extension() {
+        assert_eq!(
+            google_mime_for_path("REPORT.DOCX"),
+            Some("application/vnd.google-apps.document")
+        );
+    }
+
+    #[test]
+    fn test_google_mime_for_path_unsupported() {
+        assert_eq!(google_mime_for_path("notes.txt"), None);
+        assert_eq!(google_mime_for_path("photo.png"), None);
+        assert_eq!(google_mime_for_path("archive.zip"), None);
+    }
+
+    #[test]
+    fn test_google_mime_for_path_no_extension() {
+        assert_eq!(google_mime_for_path("README"), None);
+        assert_eq!(google_mime_for_path(""), None);
     }
 }

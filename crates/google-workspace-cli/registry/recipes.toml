@@ -494,3 +494,42 @@ steps = [
   "Write the report: `gws docs +write --document-id DOC_ID --text '## Sales Report - January 2025\n\n### Summary\nTotal deals: 45\nRevenue: $125,000\n\n### Top Deals\n1. Acme Corp - $25,000\n2. Widget Inc - $18,000'`",
   "Share with stakeholders: `gws drive permissions create --params '{\"fileId\": \"DOC_ID\"}' --json '{\"role\": \"reader\", \"type\": \"user\", \"emailAddress\": \"cfo@company.com\"}'`"
 ]
+
+[[recipes]]
+name = "create-formatted-doc"
+title = "Create a Properly-Formatted Google Doc"
+description = "Create a Google Doc with real formatting (headings, lists, tables, images) by drafting via document-skills:docx then uploading with conversion."
+category = "productivity"
+services = [ "drive" ]
+caution = "Drive transcodes the .docx into a Google Doc once at upload. Subsequent edits go through `gws docs batchUpdate`, not the source file. For purely plain-text writes to an existing Doc, use `gws-docs-write` instead."
+steps = [
+  "Invoke the `document-skills:docx` skill to draft the document. Have it save the .docx to a temp path you control, e.g. `/tmp/<slug>.docx`. The skill produces real Word XML with headings, bold, bullets, tables, and images — formatting that Drive's transcoding preserves.",
+  "Upload with conversion: `gws drive +upload /tmp/<slug>.docx --convert` (add `--parent FOLDER_ID` to drop into a folder; add `--name 'Final Title'` to override the filename).",
+  "Return the resulting `id` and `webViewLink` from the response so the user can open the new Google Doc."
+]
+
+[[recipes]]
+name = "create-formatted-sheet"
+title = "Create a Properly-Formatted Google Sheet"
+description = "Create a Google Sheet with formulas, headers, and formatting by building a .xlsx via document-skills:xlsx then uploading with conversion."
+category = "productivity"
+services = [ "drive" ]
+caution = "Drive transcodes the .xlsx into a Google Sheet once at upload. Subsequent edits go through the Sheets API (`gws sheets +append`, etc.), not the source file. For appending rows to an existing Sheet, use `gws-sheets-append` instead."
+steps = [
+  "Invoke the `document-skills:xlsx` skill to build the spreadsheet. Have it save the .xlsx to a temp path you control, e.g. `/tmp/<slug>.xlsx`. The skill handles formulas, headers, number formatting, and color-coded conventions; it also runs a recalculation step to catch formula errors before delivery.",
+  "Upload with conversion: `gws drive +upload /tmp/<slug>.xlsx --convert` (add `--parent FOLDER_ID` to drop into a folder; add `--name 'Final Title'` to override the filename).",
+  "Return the resulting `id` and `webViewLink` from the response. Formulas evaluate live in Google Sheets after the conversion."
+]
+
+[[recipes]]
+name = "create-formatted-slides"
+title = "Create a Properly-Formatted Google Slides Deck"
+description = "Create a Google Slides deck with real layouts, colors, and typography by building a .pptx via document-skills:pptx then uploading with conversion."
+category = "productivity"
+services = [ "drive" ]
+caution = "Drive transcoding preserves slide layout, text, basic shapes, and standard fonts. Animations, transitions, custom-embedded fonts, and some advanced effects may not survive the conversion. For simple title-only presentations, the existing `recipe-create-presentation` is lighter weight."
+steps = [
+  "Invoke the `document-skills:pptx` skill to build the deck. Have it save the .pptx to a temp path you control, e.g. `/tmp/<slug>.pptx`. The skill generates slides with proper layouts, bold color palettes, and typography pairings via PptxGenJS.",
+  "Upload with conversion: `gws drive +upload /tmp/<slug>.pptx --convert` (add `--parent FOLDER_ID` to drop into a folder; add `--name 'Final Title'` to override the filename).",
+  "Return the resulting `id` and `webViewLink` from the response. Spot-check the converted deck — surface any drift (missing fonts, dropped animations) to the user."
+]

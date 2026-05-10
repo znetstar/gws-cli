@@ -124,4 +124,7 @@ Multi-step task sequences with real commands.
 | [recipe-batch-invite-to-event](../skills/recipe-batch-invite-to-event/SKILL.md) | Add a list of attendees to an existing Google Calendar event and send notifications. |
 | [recipe-forward-labeled-emails](../skills/recipe-forward-labeled-emails/SKILL.md) | Find Gmail messages with a specific label and forward them to another address. |
 | [recipe-generate-report-from-sheet](../skills/recipe-generate-report-from-sheet/SKILL.md) | Read data from a Google Sheet and create a formatted Google Docs report. |
+| [recipe-create-formatted-doc](../skills/recipe-create-formatted-doc/SKILL.md) | Create a Google Doc with real formatting (headings, lists, tables, images) by drafting via document-skills:docx then… |
+| [recipe-create-formatted-sheet](../skills/recipe-create-formatted-sheet/SKILL.md) | Create a Google Sheet with formulas, headers, and formatting by building a .xlsx via document-skills:xlsx then… |
+| [recipe-create-formatted-slides](../skills/recipe-create-formatted-slides/SKILL.md) | Create a Google Slides deck with real layouts, colors, and typography by building a .pptx via document-skills:pptx then… |
 
