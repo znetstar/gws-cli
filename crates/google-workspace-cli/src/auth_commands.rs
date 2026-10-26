@@ -635,7 +635,7 @@ async fn handle_login_inner(
     // Resolve client_id and client_secret:
     // 1. Env vars (highest priority)
     // 2. Saved client_secret.json from `gws auth setup` or manual download
-    let (client_id, client_secret, project_id) = resolve_client_credentials()?;
+    let (client_id, client_secret, config_project_id) = resolve_client_credentials()?;
 
     // Persist credentials to client_secret.json if not already saved,
     // so they survive env var removal or shell session changes.
@@ -643,8 +643,15 @@ async fn handle_login_inner(
         let _ = crate::oauth_config::save_client_config(
             &client_id,
             &client_secret,
-            project_id.as_deref().unwrap_or(""),
+            config_project_id.as_deref().unwrap_or(""),
         );
+    }
+
+    let mut project_id = resolve_login_project_id(config_project_id);
+    // When re-authenticating into an existing 1Password item, reuse its stored
+    // project_id so the scope picker targets the right project.
+    if op_opts.enabled && project_id.is_none() {
+        project_id = existing_op_project_id(&op_opts).await;
     }
 
     // Determine scopes: explicit flags > interactive TUI > defaults
@@ -906,7 +913,7 @@ fn resolve_client_credentials() -> Result<(String, String, Option<String>), GwsE
         // Still try to load project_id from config file for the scope picker
         let project_id = crate::oauth_config::load_client_config()
             .ok()
-            .map(|c| c.project_id);
+            .and_then(|c| non_empty(c.project_id));
         return Ok((id, secret, project_id));
     }
 
@@ -915,7 +922,7 @@ fn resolve_client_credentials() -> Result<(String, String, Option<String>), GwsE
         Ok(config) => Ok((
             config.client_id,
             config.client_secret,
-            Some(config.project_id),
+            non_empty(config.project_id),
         )),
         Err(_) => Err(GwsError::Auth(
             format!(
@@ -929,6 +936,45 @@ fn resolve_client_credentials() -> Result<(String, String, Option<String>), GwsE
             ),
         )),
     }
+}
+
+/// Treat empty / whitespace-only strings as absent.
+fn non_empty(s: String) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Resolve the GCP project id used during login.
+///
+/// Precedence mirrors `auth::get_quota_project`: the `GOOGLE_WORKSPACE_PROJECT_ID`
+/// env var wins over the (non-empty) `client_secret.json` value. Returns `None`
+/// rather than an empty string so callers never persist a blank project_id.
+fn resolve_login_project_id(config_project_id: Option<String>) -> Option<String> {
+    std::env::var("GOOGLE_WORKSPACE_PROJECT_ID")
+        .ok()
+        .and_then(non_empty)
+        .or_else(|| config_project_id.and_then(non_empty))
+}
+
+/// Best-effort lookup of the `project_id` already stored in the target
+/// 1Password item. Only possible when the item is known before OAuth runs
+/// (`--item` or `GOOGLE_WORKSPACE_CLI_OP_ITEM`); errors are ignored because the
+/// item may not exist yet.
+async fn existing_op_project_id(op_opts: &OpLoginOpts) -> Option<String> {
+    let item = op_opts
+        .item
+        .clone()
+        .or_else(|| std::env::var("GOOGLE_WORKSPACE_CLI_OP_ITEM").ok())
+        .and_then(non_empty)?;
+    let op_ref = crate::auth_op::OpRef::parse(&item, op_opts.vault.as_deref()).ok()?;
+    crate::auth_op::read_item(&op_ref)
+        .await
+        .ok()?
+        .project_id
+        .and_then(non_empty)
 }
 
 /// Resolve OAuth scopes: explicit flags > interactive picker > defaults.
@@ -2133,6 +2179,119 @@ mod tests {
             let err_msg = result.unwrap_err().to_string();
             assert!(err_msg.contains("No OAuth client configured"));
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_client_credentials_treats_empty_project_id_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", dir.path());
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CLIENT_ID");
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET");
+        }
+        crate::oauth_config::save_client_config("id", "secret", "").unwrap();
+        let from_config = resolve_client_credentials();
+
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CLIENT_ID", "env-id");
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET", "env-secret");
+        }
+        let from_env = resolve_client_credentials();
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CLIENT_ID");
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CLIENT_SECRET");
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+        }
+
+        assert_eq!(from_config.unwrap().2, None);
+        assert_eq!(from_env.unwrap().2, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_login_project_id_precedence() {
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_PROJECT_ID");
+        }
+        assert_eq!(resolve_login_project_id(None), None);
+        assert_eq!(resolve_login_project_id(Some("  ".into())), None);
+        assert_eq!(
+            resolve_login_project_id(Some("cfg".into())),
+            Some("cfg".to_string())
+        );
+
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_PROJECT_ID", "env-proj");
+        }
+        let with_env = resolve_login_project_id(Some("cfg".into()));
+        unsafe {
+            std::env::set_var("GOOGLE_WORKSPACE_PROJECT_ID", "");
+        }
+        let with_empty_env = resolve_login_project_id(Some("cfg".into()));
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_PROJECT_ID");
+        }
+
+        assert_eq!(with_env, Some("env-proj".to_string()));
+        assert_eq!(with_empty_env, Some("cfg".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn existing_op_project_id_reads_item_without_caching() {
+        crate::auth_op::reset_cache_for_test();
+        crate::auth_op::set_op_runner_for_test(|_args| crate::auth_op::OpOutput {
+            status: Some(0),
+            stdout:
+                r#"{"title": "gws", "fields": [{"label": "project_id", "value": "stored-proj"}]}"#
+                    .to_string(),
+            stderr: String::new(),
+            spawn_error: None,
+        });
+        let opts = OpLoginOpts {
+            enabled: true,
+            item: Some("op://Vault/gws".into()),
+            ..Default::default()
+        };
+        let pid = existing_op_project_id(&opts).await;
+        let cached = crate::auth_op::cached_fields();
+        crate::auth_op::clear_op_runner_for_test();
+
+        assert_eq!(pid, Some("stored-proj".to_string()));
+        assert!(
+            cached.is_none(),
+            "pre-login peek must not seed the op cache"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn existing_op_project_id_none_when_item_missing() {
+        crate::auth_op::set_op_runner_for_test(|_args| crate::auth_op::OpOutput {
+            status: Some(1),
+            stdout: String::new(),
+            stderr: "\"gws\" isn't an item.".to_string(),
+            spawn_error: None,
+        });
+        unsafe {
+            std::env::remove_var("GOOGLE_WORKSPACE_CLI_OP_ITEM");
+        }
+        let with_item = existing_op_project_id(&OpLoginOpts {
+            enabled: true,
+            item: Some("op://Vault/gws".into()),
+            ..Default::default()
+        })
+        .await;
+        let without_item = existing_op_project_id(&OpLoginOpts {
+            enabled: true,
+            ..Default::default()
+        })
+        .await;
+        crate::auth_op::clear_op_runner_for_test();
+
+        assert_eq!(with_item, None);
+        assert_eq!(without_item, None);
     }
 
     #[test]
