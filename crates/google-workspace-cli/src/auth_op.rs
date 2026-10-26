@@ -395,14 +395,22 @@ pub async fn fetch_item(op_ref: &OpRef) -> anyhow::Result<OpItemFields> {
     if let Some(cached) = CACHED.lock().unwrap().clone() {
         return Ok(cached);
     }
+    let fields = read_item(op_ref).await?;
+    *CACHED.lock().unwrap() = Some(fields.clone());
+    Ok(fields)
+}
+
+/// Fetch and parse an item without touching the process-wide cache.
+///
+/// Used by `gws auth login` to peek at an existing item (e.g. its stored
+/// `project_id`) before the item is rewritten with fresh credentials.
+pub async fn read_item(op_ref: &OpRef) -> anyhow::Result<OpItemFields> {
     let args = op_ref.op_get_args();
     let output = run_op(&args).await;
     if !output.success() {
         return Err(translate_op_error(&args, &output));
     }
-    let fields = parse_op_item_json(&output.stdout)?;
-    *CACHED.lock().unwrap() = Some(fields.clone());
-    Ok(fields)
+    parse_op_item_json(&output.stdout)
 }
 
 // ── Write path: create or update a 1Password item ──────────────────
@@ -474,27 +482,29 @@ pub async fn put_item(
     }
 }
 
+/// Build `op item create/edit` assignment statements for the populated fields.
+///
+/// Empty values are skipped: `op item edit` would otherwise clear the existing
+/// field (e.g. wiping a stored `project_id`), whereas omitting the assignment
+/// leaves it untouched.
 fn build_field_assignments(f: &OpItemFields) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if let Some(v) = &f.client_id {
-        out.push(format!("client_id[text]={v}"));
-    }
-    if let Some(v) = &f.client_secret {
-        out.push(format!("client_secret[concealed]={v}"));
-    }
-    if let Some(v) = &f.refresh_token {
-        out.push(format!("refresh_token[concealed]={v}"));
-    }
-    if let Some(v) = &f.account {
-        out.push(format!("account[text]={v}"));
-    }
-    if let Some(v) = &f.project_id {
-        out.push(format!("project_id[text]={v}"));
-    }
-    if let Some(v) = &f.service_account_json {
-        out.push(format!("service_account_json[concealed]={v}"));
-    }
-    out
+    let pairs: [(&str, &Option<String>); 6] = [
+        ("client_id[text]", &f.client_id),
+        ("client_secret[concealed]", &f.client_secret),
+        ("refresh_token[concealed]", &f.refresh_token),
+        ("account[text]", &f.account),
+        ("project_id[text]", &f.project_id),
+        ("service_account_json[concealed]", &f.service_account_json),
+    ];
+    pairs
+        .iter()
+        .filter_map(|(key, value)| {
+            value
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| format!("{key}={v}"))
+        })
+        .collect()
 }
 
 async fn item_exists(op_ref: &OpRef) -> anyhow::Result<bool> {
@@ -759,6 +769,66 @@ mod tests {
         assert!(a.contains(&"refresh_token[concealed]=rt".to_string()));
         assert!(a.contains(&"account[text]=a@b.com".to_string()));
         assert!(a.contains(&"project_id[text]=pid".to_string()));
+    }
+
+    #[test]
+    fn build_field_assignments_skips_empty_values() {
+        let f = OpItemFields {
+            client_id: Some("cid".into()),
+            refresh_token: Some("rt".into()),
+            account: Some("   ".into()),
+            project_id: Some(String::new()),
+            ..Default::default()
+        };
+        let a = build_field_assignments(&f);
+        assert_eq!(
+            a,
+            vec![
+                "client_id[text]=cid".to_string(),
+                "refresh_token[concealed]=rt".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn put_item_overwrite_preserves_project_id_when_empty() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        let calls: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        set_op_runner_for_test(move |args| {
+            recorded.lock().unwrap().push(args.to_vec());
+            // `item get` (existence check) succeeds, as does `item edit`.
+            OpOutput {
+                status: Some(0),
+                stdout: sample_oauth_item().to_string(),
+                stderr: String::new(),
+                spawn_error: None,
+            }
+        });
+
+        let op_ref = OpRef::parse("op://LLC/item", None).unwrap();
+        let fields = OpItemFields {
+            client_id: Some("cid".into()),
+            client_secret: Some("csec".into()),
+            refresh_token: Some("new-rt".into()),
+            project_id: Some(String::new()),
+            ..Default::default()
+        };
+        put_item(&op_ref, &fields, true).await.unwrap();
+        clear_op_runner_for_test();
+
+        let calls = calls.lock().unwrap();
+        let edit = calls
+            .iter()
+            .find(|a| a.get(1).map(String::as_str) == Some("edit"))
+            .expect("expected an `op item edit` call");
+        assert!(edit.contains(&"refresh_token[concealed]=new-rt".to_string()));
+        assert!(
+            !edit.iter().any(|a| a.starts_with("project_id")),
+            "empty project_id must not be sent to `op item edit`: {edit:?}"
+        );
     }
 
     #[test]
